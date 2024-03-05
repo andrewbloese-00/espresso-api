@@ -6,6 +6,9 @@ import http, { IncomingMessage } from "http";
  * @typedef {"json"|"urlencoded"|'urlencoded-extended'} BodyParserName
  * @typedef {{parsers:BodyParserName[]}} ContextOptions
  * @typedef {((req:IncomingMessage)=>Promise<[null,any]|[unknown,null]>)} BodyParser
+ * @typedef {{uid: string, [key:string]:any}} Session
+ * @typedef {{getSession: ((id:string)=>Promise<Session|null>), deleteSession: ((id)=>Promise<void>), createSession:(value:any) => Promise<string>}} ISessionStore
+ * @typedef {{getUser: ((id:string)=>Promise<any|null>),  createUser:(value:any) => Promise<string|null>}} IUserStore
  */
 
 const PARAM_REGEX_STR = "([^/]+)";
@@ -23,7 +26,7 @@ export const HTTP_STATUS_CODES = {
   NOT_IMPL: 501,
   BAD_GATEWAY: 502,
 };
-export const EspressoError = (message, code) => ({ message, code });
+export const EspressoError = (message, code) => ({ error: { message, code } });
 export class EspressoRouter {
   /**
    * @param {...EspressoRoute} routes
@@ -201,6 +204,7 @@ export class EspressoContext {
   constructor(req, res, options) {
     this.params = {};
     this.query = {};
+    this.cookies = {};
     this.body = {};
     this.data = {};
     this._req = req;
@@ -221,6 +225,20 @@ export class EspressoContext {
 
   set(key, value) {
     this.data[key] = value;
+  }
+
+  /**
+   * @param {{[cookieName:string]:(string|number|boolean)}} cookiesObj
+   */
+  setCookies(cookiesObj) {
+    //sets the response cookies based on input cookiesObject
+    const cookieStr = Object.entries(cookiesObj)
+      .map(([k, v]) => k + "=" + encodeURIComponent(v))
+      .join("; ");
+
+    if (cookieStr.length / 2 > 4096)
+      console.error("Max cookies length exceeded, will not set cookies.");
+    else this._res.setHeader("Set-Cookie", cookieStr);
   }
 
   /**
@@ -259,7 +277,7 @@ export class EspressoContext {
    * @param {EspressoRoute} route required for query param checking
    * @description parses the 'query params' portion of the url and attaches as an object to the `<EspressoContext>.query` field.
    */
-  async parseQuery(route) {
+  parseQuery(route) {
     const query = this._req.url.split("?").pop();
     const recievedQueryParams = query.split("&");
     for (let keyValuePair of recievedQueryParams) {
@@ -270,6 +288,20 @@ export class EspressoContext {
         this.query[key] = value;
       }
     }
+  }
+
+  parseCookies() {
+    if (this._req.headers.cookie) {
+      const rawCookies = this._req.headers.cookie.split(";");
+      for (let i = 0; i < rawCookies.length; i++) {
+        let [name, ...rest] = rawCookies[i].split("=");
+        name = name?.trim();
+        const value = rest.join("=".trim());
+        if (!value) return;
+        this.cookies[name] = decodeURIComponent(value);
+      }
+    }
+    //Thanks to https://stackoverflow.com/questions/3393854/get-and-set-a-single-cookie-with-node-js-http-server
   }
 
   /**
@@ -333,8 +365,10 @@ export async function Espresso(router, port = 8080) {
     if (Object.keys(route.paramSchema).length > 0) {
       await ctx.parseParams(route);
     }
+    //only attempt to parse cookies when present
+    if (req.headers.cookie) ctx.parseCookies();
 
-    await ctx.parseQuery(route);
+    ctx.parseQuery(route);
     if (req.method.toLowerCase() !== "get") canUse = await ctx.parseBody();
     console.timeEnd("parse request");
     if (!canUse)
@@ -352,20 +386,74 @@ export async function Espresso(router, port = 8080) {
 }
 
 /**
- * @param {EspressoContext} ctx
+ * @param {IUserStore} userStore
  */
-export const EspressoBearerProtect = (ctx) => {
-  const ERR = EspressoError(
-    "Must be signed in to access this route!",
-    HTTP_STATUS_CODES.FORBIDDEN,
-  );
-  const token = ctx.bearer();
-  if (!token) return ERR;
+export function getBearerProtect(userStore) {
+  /**
+   * @param {EspressoContext} ctx
+   */
+  return async (ctx) => {
+    const ERR = EspressoError(
+      "Must be signed in to access this route!",
+      HTTP_STATUS_CODES.FORBIDDEN,
+    );
+    const token = ctx.bearer();
+    if (!token) return ERR;
 
-  //'decode token'
-  const id = token.split(".")[1];
-  const user = Users.find((u) => u.id == id);
-  if (user) {
-    const { password, ...safeUser } = ctx.set("user", safeUser);
-  } else return ERR;
-};
+    //'decode token'
+    const id = token.split(".")[1];
+    const user = await userStore.getUser(id);
+    if (user) {
+      const { password, ...safeUser } = ctx.set("user", safeUser);
+    } else return ERR;
+  };
+}
+
+/**
+ * @param {ISessionStore} sessionStore
+ * @param {IUserStore} userStore
+ */
+export function getSessionProtect(sessionStore, userStore) {
+  /**
+   * @param {EspressoContext} ctx
+   */
+  return async (ctx) => {
+    const FORBIDDEN_ERR = EspressoError(
+      "Invalid Session",
+      HTTP_STATUS_CODES.FORBIDDEN,
+    );
+    if (ctx.cookies.sessionId) {
+      const sesh = await sessionStore.getSession(ctx.cookies.sessionId);
+      if (!sesh) return FORBIDDEN_ERR;
+
+      const user = await userStore.getUser(sesh.uid);
+      if (!user) return FORBIDDEN_ERR;
+      const { password, ...safeUser } = user;
+      ctx.set("user", safeUser);
+    } else {
+      return FORBIDDEN_ERR;
+    }
+  };
+}
+
+/**
+ * @param Creates an object adhering to ISessionStore using the 'db' object as an in memory session store.
+ */
+export const EspressoSessions = (db = {}) => ({
+  getSession: (id) => {
+    if (db[id]) return db[id];
+  },
+  createSession: (value) => {
+    if (!value.uid) return null;
+    const sessionId = randomBytes(24).toString("hex");
+    db[sessionId] = value;
+    return sessionId;
+  },
+  deleteSession: (id) => {
+    if (db[id]) {
+      delete db[id];
+      return true;
+    }
+    return false;
+  },
+});

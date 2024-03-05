@@ -1,36 +1,36 @@
-//example using bearer <token> method with headers
 import {
   Espresso,
   EspressoError,
   HTTP_STATUS_CODES,
   EspressoRoute as Route,
   EspressoRouter as Router,
-  getBearerProtect, //protect middleware using "Bearer <token>" autho
+  EspressoSessions,
+  getSessionProtect,
 } from "../src/Espresso.js";
-
 import { randomBytes } from "crypto";
 
-//"db"
 const UsersDB = [];
+const sessions = {}; //optionally have initial state for the session store...
+const store = EspressoSessions(sessions);
 
-//implement a user store
+//implement a user store. "implements" IUserStore
 const User = {
   getUser: async (id) => {
-    const user = await user.find((u) => u.id == id);
+    const user = await UsersDB.find((u) => u.uid == id);
     return user || null;
   },
   createUser(user) {
     if (!user.username || !user.email || !user.password) return null;
-    const id = randomBytes(24).toString("hex");
-    UsersDB.push({ id, ...user });
-    return id;
+    const uid = randomBytes(24).toString("hex");
+    UsersDB.push({ uid, ...user });
+    return uid;
   },
 };
 
-//middleware
-const BearerProtect = getBearerProtect(User);
+//create session middleware, providing the applications session and user store
+const ProtectSession = getSessionProtect(store, User);
 
-//routes
+//define basic auth routes
 const signin = new Route("post", "/auth/signin", {}, async (ctx) => {
   const { email, password } = ctx.body;
   if (!email || !password)
@@ -42,10 +42,13 @@ const signin = new Route("post", "/auth/signin", {}, async (ctx) => {
   const user = UsersDB.find((u) => u.email === email);
   if (!user || user.password !== password)
     return EspressoError("Invalid Credentials", HTTP_STATUS_CODES.FORBIDDEN);
-
+  else {
+    const sessionId = EspressoSessions.createSession(user);
+    ctx.setCookies({ sessionId });
+  }
   return {
     ok: 201,
-    payload: { token: user.id },
+    payload: { message: "Signed in Successfully!" },
   };
 });
 const signup = new Route("post", "/auth/signup", {}, async (ctx) => {
@@ -59,16 +62,24 @@ const signup = new Route("post", "/auth/signup", {}, async (ctx) => {
   //'generate user id'
   const reply = User.createUser({ username, email, password });
   if (!reply) return;
-  //'sign' a token
 
-  const token = `${Date.now()}.${id}`;
+  const user = await User.getUser(reply);
+
+  const sessionId = EspressoSessions.createSession(user);
+  if (!sessionId)
+    return EspressoError(
+      "Could not create session!",
+      HTTP_STATUS_CODES.INTERNAL,
+    );
+
+  ctx.setCookies({ sessionId });
   return {
     ok: 201,
-    payload: { token },
+    payload: { message: "Signed Up Successfully!" },
   };
 });
-//route with middleware
-const account = new Route("get", "/auth/account", {}, BearerProtect, (ctx) => {
+//route with session middleware
+const account = new Route("get", "/auth/account", {}, ProtectSession, (ctx) => {
   return {
     ok: 200,
     payload: { user: ctx.data.user },
