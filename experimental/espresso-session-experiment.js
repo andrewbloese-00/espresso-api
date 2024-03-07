@@ -4,14 +4,14 @@ import {
   HTTP_STATUS_CODES,
   EspressoRoute as Route,
   EspressoRouter as Router,
-  EspressoSessions,
   getSessionProtect,
 } from "../src/Espresso.js";
+
 import { randomBytes } from "crypto";
+import { EspressoSessionStore } from "../src/EspressoSessionStore.js";
 
 const UsersDB = [];
-const sessions = {}; //optionally have initial state for the session store...
-const store = EspressoSessions(sessions);
+const store = new EspressoSessionStore();
 
 //implement a user store. "implements" IUserStore
 const User = {
@@ -43,7 +43,7 @@ const signin = new Route("post", "/auth/signin", {}, async (ctx) => {
   if (!user || user.password !== password)
     return EspressoError("Invalid Credentials", HTTP_STATUS_CODES.FORBIDDEN);
   else {
-    const sessionId = EspressoSessions.createSession(user);
+    const sessionId = store.createSession(user);
     ctx.setCookies({ sessionId });
   }
   return {
@@ -65,7 +65,7 @@ const signup = new Route("post", "/auth/signup", {}, async (ctx) => {
 
   const user = await User.getUser(reply);
 
-  const sessionId = EspressoSessions.createSession(user);
+  const sessionId = store.createSession({ uid: user.uid });
   if (!sessionId)
     return EspressoError(
       "Could not create session!",
@@ -86,6 +86,22 @@ const account = new Route("get", "/auth/account", {}, ProtectSession, (ctx) => {
   };
 });
 
-const app = new Router(signin, signup, account);
+const logout = new Route("get", "/auth/logout", {}, ProtectSession, (ctx) => {
+  const deleted =
+    ctx.cookies.sessionId && store.endSession(ctx.cookies.sessionId);
+  if (!deleted)
+    return EspressoError(
+      "Failed to logout, no session specified",
+      HTTP_STATUS_CODES.BAD_REQUEST,
+    );
+
+  ctx.setCookies({ sessionId: "NULL", ...ctx.cookies }); //remove the session cookie on logout
+  return {
+    ok: 200,
+    payload: { message: "Successfully signed out!" },
+  };
+});
+
+const app = new Router(signin, signup, logout, account);
 
 Espresso(app, 5432);

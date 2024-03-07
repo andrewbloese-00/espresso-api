@@ -1,18 +1,48 @@
-import http, { IncomingMessage } from "http";
+import http from "http";
+import { EspressoSessionStore } from "./EspressoSessionStore.js";
 
+//START TYPEDEFS
 /**
  * @typedef {{error?:EspressoErr, ok?:number}} EspressoHandlerResponse
  * @typedef {{message: string, code: number}} EspressoErr
  * @typedef {"json"|"urlencoded"|'urlencoded-extended'} BodyParserName
- * @typedef {{parsers:BodyParserName[]}} ContextOptions
- * @typedef {((req:IncomingMessage)=>Promise<[null,any]|[unknown,null]>)} BodyParser
+ * @typedef {((req:http.IncomingMessage)=>Promise<[null,any]|[unknown,null]>)} BodyParser
  * @typedef {{uid: string, [key:string]:any}} Session
- * @typedef {{getSession: ((id:string)=>Promise<Session|null>), deleteSession: ((id)=>Promise<void>), createSession:(value:any) => Promise<string>}} ISessionStore
+ * @typedef {{
+ * sync:boolean,
+ * createSession: ((uid:string)=>string|(uid:string)=>Promise<string>),
+ * getSession: (((sessionId:string)=>Session|null)|(sessionId:string)=>Promise<Session|null>)
+ * updateSession: ((sessionId:string,updates:any)=>boolean|(sessionId:string,updates:any)=>Promise<boolean>)
+ * endSession: ((sessionId:string)=>boolean|(sessionId:string)=>Promise<boolean>)
+ * }} SessionStore
  * @typedef {{getUser: ((id:string)=>Promise<any|null>),  createUser:(value:any) => Promise<string|null>}} IUserStore
  */
 
-const PARAM_REGEX_STR = "([^/]+)";
+//END TYPEDEFS
 
+const PARAM_REGEX_STR = "([^/]+)";
+/**
+ * @type {{[name:string]:BodyParser}}
+ */
+const BodyParsers = {
+  json: (req) =>
+    new Promise((resolve) => {
+      let chunks = [];
+      req.on("data", (chunk) => {
+        chunks.push(chunk);
+      });
+      req.on("end", () => {
+        try {
+          const payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+          resolve([null, payload]);
+        } catch (error) {
+          resolve([error, null]);
+        }
+      });
+    }),
+  urlencoded: (req) => {},
+  "urlencoded-extended": (req) => {},
+};
 export const HTTP_STATUS_CODES = {
   OK: 200,
   CREATED: 201,
@@ -26,7 +56,16 @@ export const HTTP_STATUS_CODES = {
   NOT_IMPL: 501,
   BAD_GATEWAY: 502,
 };
+
+/**
+ * @param {string} message the error message
+ * @param {number} code an error status code
+ */
 export const EspressoError = (message, code) => ({ error: { message, code } });
+
+/**
+ * @description the hub for Espresso, uses regex based path matching
+ */
 export class EspressoRouter {
   /**
    * @param {...EspressoRoute} routes
@@ -67,7 +106,6 @@ export class EspressoRouter {
     for (let [i, param] of paramNames) {
       espressoRoute.paramSchema[param].segmentNumber = i;
     }
-    // `^/${re.join("/")}/?$`
     const regex = new RegExp(`^/${re.join("/")}(\\?.*)?$`);
     this.routes[espressoRoute.method].push({
       regex,
@@ -96,6 +134,9 @@ export class EspressoRouter {
   }
 }
 
+/**
+ * @description an API Route for Espresso, currently supports get, post, put, and delete requests.
+ */
 export class EspressoRoute {
   /**
    * @param {"get"|"post"|"put"|"delete"} method
@@ -173,35 +214,14 @@ export class EspressoRoute {
 }
 
 /**
- * @type {{[name:string]:BodyParser}}
+ * @description a wrapper for the standard `http.IncomingRequest` and `http.ServerResponse` provides parsers for query parameters, url params, and json bodies. Helper functions for common response types like json, text, and errors.
  */
-const BodyParsers = {
-  json: (req) =>
-    new Promise((resolve) => {
-      let chunks = [];
-      req.on("data", (chunk) => {
-        chunks.push(chunk);
-      });
-      req.on("end", () => {
-        try {
-          const payload = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
-          resolve([null, payload]);
-        } catch (error) {
-          resolve([error, null]);
-        }
-      });
-    }),
-  urlencoded: (req) => {},
-  "urlencoded-extended": (req) => {},
-};
-
 export class EspressoContext {
   /**
    * @param {http.IncomingMessage} req
    * @param {http.ServerResponse} res
-   * @param {ContextOptions} options
    */
-  constructor(req, res, options) {
+  constructor(req, res) {
     this.params = {};
     this.query = {};
     this.cookies = {};
@@ -209,9 +229,9 @@ export class EspressoContext {
     this.data = {};
     this._req = req;
     this._res = res;
-    this._options = options;
   }
 
+  //header helpers
   /**
    * @about checks the request headers for a Bearer <token> authorization header, and returns the <token> , or null if none found
    */
@@ -221,10 +241,6 @@ export class EspressoContext {
       return token || null;
     }
     return null;
-  }
-
-  set(key, value) {
-    this.data[key] = value;
   }
 
   /**
@@ -241,29 +257,37 @@ export class EspressoContext {
     else this._res.setHeader("Set-Cookie", cookieStr);
   }
 
+  //parsers
   /**
    * @description parses the context request body, storing parsed fields in `<EspressoContext>.body` returns false if parse fails, true otherwise
    */
   async parseBody() {
-    for (let i = 0; i < this._options.parsers.length; i++) {
-      let p = BodyParsers[this._options.parsers[i]];
-      if (typeof p === "function") {
-        const [error, payload] = await p(this._req);
-        if (error === null) {
-          for (let key in payload) {
-            this.body[key] = payload[key];
-          }
-        } else {
-          console.error(error);
+    //currently only supports json body
+    switch (this._req.headers["content-type"]) {
+      case "application/json": {
+        const [error, payload] = await BodyParsers.json(this._req);
+        if (error) {
+          console.error("Failed to parse body 'json'", error);
           return false;
         }
-      } else console.warn("Invalid Parser Option, Skipping...");
+        //attach the parsed json body to the context
+        this.body = payload;
+        return true;
+      }
+      case "application/x-www-form-urlencoded": {
+        console.warn("Not Yet Supported");
+        return false;
+      }
+      default:
+        console.error(
+          `Unsupported content-type: ${this._req.headers["content-type"]}`,
+        );
+        return false;
     }
-    return true;
   }
   /**
    * @param {EspressoRoute} route
-   * @description parses the params defined on a route. attaches the to `<EspressoContext>.params` field as an object
+   * @description parses the params defined on a route. attaches the to `< EspressoContext >.params` field as an object
    */
   async parseParams(route) {
     const segments = this._req.url.split("/").filter(Boolean);
@@ -275,7 +299,7 @@ export class EspressoContext {
   }
   /**
    * @param {EspressoRoute} route required for query param checking
-   * @description parses the 'query params' portion of the url and attaches as an object to the `<EspressoContext>.query` field.
+   * @description parses the 'query params' portion of the url and attaches as an object to the `< EspressoContext >.query` field.
    */
   parseQuery(route) {
     const query = this._req.url.split("?").pop();
@@ -304,6 +328,7 @@ export class EspressoContext {
     //Thanks to https://stackoverflow.com/questions/3393854/get-and-set-a-single-cookie-with-node-js-http-server
   }
 
+  //response helpers
   /**
    * @param {number} code an http status code
    * @description responds using the context response object with an error message and code
@@ -350,13 +375,16 @@ export class EspressoContext {
 }
 
 /**
- * @param {EspressoRouter} router
+ * @param {EspressoRouter} router your espresso router with routes defined
+ * @param {number} port the port to launch the espresso app on.
+ * @description The 'driver' for espresso router
  */
 export async function Espresso(router, port = 8080) {
   const server = http.createServer(async (req, res) => {
-    const ctx = new EspressoContext(req, res, { parsers: ["json"] });
+    const ctx = new EspressoContext(req, res);
     const route = router.findRoute(req);
     if (!route) {
+      //Not Found
       return ctx.error(`No Route For: ${req.url}`, HTTP_STATUS_CODES.NOT_FOUND);
     }
     if (!route["paramSchema"]) route["paramSchema"] = {};
@@ -374,43 +402,41 @@ export async function Espresso(router, port = 8080) {
     if (!canUse)
       return ctx.error("Error In Parsing", HTTP_STATUS_CODES.BAD_REQUEST);
 
-    console.time(`[${route.method} ${route.path}] handlers`);
+    console.time(`[${route.method} ${route.path}]handlers`);
     await route.use(ctx);
-    console.timeEnd(`[${route.method} ${route.path}] handlers`);
+    console.timeEnd(`[${route.method} ${route.path}]handlers`);
   });
 
   server.listen(port, () => {
-    console.log(`☕️ Espresso Listening via HTTP on :${port}`);
+    console.log(`☕️ Espresso Listening via HTTP on : ${port}`);
   });
   return server;
 }
 
+//middleware helpers
 /**
  * @param {IUserStore} userStore
+ * @param {(token:string)=>string} decodeToIdFn a function that returns the id of the user the token belongs to
  */
-export function getBearerProtect(userStore) {
+export function getBearerProtect(userStore, decodeToIdFn) {
   /**
    * @param {EspressoContext} ctx
    */
   return async (ctx) => {
-    const ERR = EspressoError(
-      "Must be signed in to access this route!",
-      HTTP_STATUS_CODES.FORBIDDEN,
-    );
+    const ERR = EspressoError("No Token!", HTTP_STATUS_CODES.FORBIDDEN);
     const token = ctx.bearer();
     if (!token) return ERR;
-
-    //'decode token'
-    const id = token.split(".")[1];
+    const id = decodeToIdFn(token);
     const user = await userStore.getUser(id);
     if (user) {
-      const { password, ...safeUser } = ctx.set("user", safeUser);
+      const { password, ...safeUser } = user;
+      ctx.data["user"] = safeUser;
     } else return ERR;
   };
 }
 
 /**
- * @param {ISessionStore} sessionStore
+ * @param {EspressoSessionStore|SessionStore} sessionStore
  * @param {IUserStore} userStore
  */
 export function getSessionProtect(sessionStore, userStore) {
@@ -423,37 +449,18 @@ export function getSessionProtect(sessionStore, userStore) {
       HTTP_STATUS_CODES.FORBIDDEN,
     );
     if (ctx.cookies.sessionId) {
-      const sesh = await sessionStore.getSession(ctx.cookies.sessionId);
+      const sesh = sessionStore.sync
+        ? sessionStore.getSession(ctx.cookies.sessionId)
+        : await sessionStore.getSession(ctx.cookies.sessionId); //only await for async sessionStore
+
       if (!sesh) return FORBIDDEN_ERR;
 
       const user = await userStore.getUser(sesh.uid);
       if (!user) return FORBIDDEN_ERR;
       const { password, ...safeUser } = user;
-      ctx.set("user", safeUser);
+      ctx.data["user"] = safeUser;
     } else {
       return FORBIDDEN_ERR;
     }
   };
 }
-
-/**
- * @param Creates an object adhering to ISessionStore using the 'db' object as an in memory session store.
- */
-export const EspressoSessions = (db = {}) => ({
-  getSession: (id) => {
-    if (db[id]) return db[id];
-  },
-  createSession: (value) => {
-    if (!value.uid) return null;
-    const sessionId = randomBytes(24).toString("hex");
-    db[sessionId] = value;
-    return sessionId;
-  },
-  deleteSession: (id) => {
-    if (db[id]) {
-      delete db[id];
-      return true;
-    }
-    return false;
-  },
-});
