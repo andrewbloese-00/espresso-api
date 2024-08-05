@@ -1,5 +1,17 @@
 <h1 style="font-size: 5rem"> DO NOT USE - NOT MAINTAINED OR REALLY EVEN COMPLETED </h1>
 
+Although some basic rest api framework features are present, I can not reccommend you use this. This was an exercise in understanding the node standard http library. 
+- Experimented with a `type-safe`ish router, with customizable urlQuery and urlParam schemas ( 'type check' at runtime ) 
+  - Router routes seperated into a table by their http method , and paths are matched using regex (generated based on simple string route definitions)
+- A `Context` that allows data to be passed through middleware on an endpoint.
+- JSON body parsing and basic cookie setting and parsing.
+- Each route follow sort of a `pipeline`
+  -  top of pipe = first `handler`
+  -  results of each middleware can be stored in the `EspressoContext` parameter, (the same context throughout the pipeline for each request)
+  -  more expressive ways to signify server  responses
+    a) simply return the payload / status codes to break out at any point in the pipeline)
+    b) use `ctx` helper functions like `.json()` or `.text()`
+ 
 
 
 # Espresso
